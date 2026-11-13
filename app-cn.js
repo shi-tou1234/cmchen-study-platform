@@ -514,8 +514,12 @@ function handleAdvancedAction(action) {
       const roots = solvePolynomialRealOnly(coeffs);
       setAdvancedResult(`根: ${roots.join(", ") || "在 [-100, 100] 范围内未找到实根"}`);
     } else if (action === "solve-newton") {
-      const root = solveByNewtonSimple(state.equation.solveExpression, Number(state.equation.solveInitial || 1));
-      setAdvancedResult(`x≈${formatNumber(root)}`);
+      const result = solveByNewtonSimple(state.equation.solveExpression, Number(state.equation.solveInitial || 1));
+      if (result.ok) {
+        setAdvancedResult(`x≈${formatNumber(result.root)} (残差≈${formatNumber(result.residual)})`);
+      } else {
+        setAdvancedResult(`牛顿法未收敛：${result.reason}`);
+      }
     } else if (action === "solve-ineq") {
       const coeffs = state.equation.inequalityCoefficients;
       const roots = solvePolynomialRealOnly(coeffs);
@@ -760,46 +764,245 @@ function solveLinearSystem(rows) {
   return aug.map((r) => r[n]);
 }
 
-function solvePolynomialRealOnly(coeffs) {
-  const roots = [];
-  for (let x = -100; x <= 100; x += 0.5) {
-    const y1 = polyEval(coeffs, x);
-    const y2 = polyEval(coeffs, x + 0.5);
-    if (y1 === 0) roots.push(formatNumber(x));
-    if (y1 * y2 < 0) roots.push(formatNumber(bisectRoot(coeffs, x, x + 0.5)));
+// 去掉高次零系数，返回真正降幂排列的系数（零多项式退化为 [0]）
+function trimPolynomialCoeffs(coeffs) {
+  const arr = Array.isArray(coeffs) ? coeffs.slice() : [];
+  let start = 0;
+  while (start < arr.length - 1 && arr[start] === 0) start += 1;
+  return arr.slice(start);
+}
+
+// 降幂多项式求导：[a_n, ..., a_0] -> [n*a_n, ..., 1*a_1]
+function derivativeCoeffs(coeffs) {
+  const n = coeffs.length - 1;
+  const out = [];
+  for (let i = 0; i < n; i += 1) out.push(coeffs[i] * (n - i));
+  return out;
+}
+
+// 在 x 处估计 |p(x)| 各项绝对值之和，作为相对残差容差的尺度
+function polynomialResidualScale(coeffs, x) {
+  const deg = coeffs.length - 1;
+  const ax = Math.max(1, Math.abs(x));
+  let scale = 0;
+  for (let i = 0; i < coeffs.length; i += 1) {
+    scale += Math.abs(coeffs[i]) * Math.pow(ax, deg - i);
   }
-  return Array.from(new Set(roots)).slice(0, 8);
+  return Math.max(scale, Number.MIN_VALUE);
+}
+
+// 合并相近数值（节点或根），按相对容差；返回升序数组
+function mergeCloseValues(values, relTol) {
+  const sorted = values.slice().sort((a, b) => a - b);
+  const merged = [];
+  for (const v of sorted) {
+    if (merged.length && Math.abs(v - merged[merged.length - 1]) <= relTol * Math.max(1, Math.abs(v))) {
+      merged[merged.length - 1] = (merged[merged.length - 1] + v) / 2;
+    } else {
+      merged.push(v);
+    }
+  }
+  return merged;
+}
+
+// 递归求多项式全部实根（数值，未格式化）：
+// 用导数的实根把区间划分为单调段，段内二分；驻点处用残差检测偶数重根。
+// extraNodes 为顶层追加的划分点（均匀网格，保留原有步长语义）。
+// 说明：单纯缩小步长无法一般性处理重根（偶数重根处函数不变号），故必须借助临界点。
+function collectPolynomialRoots(coeffs, lo, hi, extraNodes, relTol, mergeTol) {
+  const c = trimPolynomialCoeffs(coeffs);
+  const deg = c.length - 1;
+  if (deg <= 0) return []; // 常数（含零多项式）无离散根
+  if (deg === 1) {
+    const root = -c[1] / c[0];
+    return Number.isFinite(root) && root >= lo - mergeTol && root <= hi + mergeTol ? [root] : [];
+  }
+  // 导数临界点递归求解；递归层不再插入网格，避免逐层细分造成性能退化
+  const critical = collectPolynomialRoots(derivativeCoeffs(c), lo, hi, [], relTol, mergeTol);
+  const rawNodes = [lo, hi, ...critical, ...extraNodes];
+  const nodes = mergeCloseValues(
+    rawNodes.filter((v) => Number.isFinite(v) && v >= lo - mergeTol && v <= hi + mergeTol),
+    mergeTol
+  );
+  const residualAt = (x) => relTol * polynomialResidualScale(c, x);
+  // 驻点是否为根只允许 Horner 求值的舍入误差，而非固定的近零容差。
+  // 这里用实际 |x| 估计各项绝对值之和：x=0 时，非零常数项不能
+  // 因为其它系数较大被当作零（如 x²+1e-14）。
+  const stationaryAt = (x) => {
+    const scale = c.reduce((acc, value) => acc * Math.abs(x) + Math.abs(value), 0);
+    return 8 * c.length * Number.EPSILON * scale;
+  };
+  const roots = [];
+  for (let i = 0; i < nodes.length; i += 1) {
+    const fx = polyEval(c, nodes[i]);
+    if (Number.isFinite(fx) && Math.abs(fx) <= stationaryAt(nodes[i])) roots.push(nodes[i]);
+  }
+  // 单调段内符号变化用二分求单根。
+  // 直接比较符号而不做乘积：系数整体极小（1e-200）时乘积会下溢为 0，
+  // 系数整体极大时会上溢为 ±Infinity，两种情况都会丢掉符号变化信息。
+  // 端点残差落在舍入噪声带内时跳过：此时该端点已按节点根处理，
+  // 再二分只会在「p 被舍入成 0 的平台」边缘造出一个假根（如三阶重根 (x-0.2)^3）。
+  for (let i = 0; i < nodes.length - 1; i += 1) {
+    const fa = polyEval(c, nodes[i]);
+    const fb = polyEval(c, nodes[i + 1]);
+    if (!Number.isFinite(fa) || !Number.isFinite(fb)) continue;
+    if (Math.abs(fa) <= stationaryAt(nodes[i]) || Math.abs(fb) <= stationaryAt(nodes[i + 1])) continue;
+    if ((fa < 0 && fb > 0) || (fa > 0 && fb < 0)) {
+      roots.push(bisectRoot(c, nodes[i], nodes[i + 1]));
+    }
+  }
+  // 残差校验 + 范围过滤 + 相近根去重
+  const valid = roots.filter(
+    (r) => Number.isFinite(r) && r >= lo - mergeTol && r <= hi + mergeTol && Math.abs(polyEval(c, r)) <= residualAt(r)
+  );
+  return mergeCloseValues(valid, mergeTol);
+}
+
+function solvePolynomialRealOnly(coeffs, options) {
+  const opts = options || {};
+  // 保持原有扫描范围与步长语义，并允许按需配置：{ min, max, step }
+  const lo = Number.isFinite(opts.min) ? opts.min : -100;
+  const hi = Number.isFinite(opts.max) ? opts.max : 100;
+  const step = Number.isFinite(opts.step) && opts.step > 0 ? opts.step : 0.5;
+  const relTol = 1e-9;   // 相对残差容差（用于最终残差校验）
+  const mergeTol = 1e-7; // 相近根/节点合并容差
+  if (!(hi > lo)) return [];
+  const source = trimPolynomialCoeffs(coeffs);
+  if (!source.length) return [];
+  // 系数归一化：整体除以 max|coeff|。等比例缩放的同一方程（如 ×1e-200 或 ×1e200）
+  // 归一化后完全相同，从而避免量级极小导致乘积下溢、量级极大导致尺度上溢。
+  let maxAbs = 0;
+  for (const v of source) {
+    const a = Math.abs(v);
+    if (Number.isFinite(a) && a > maxAbs) maxAbs = a;
+  }
+  if (!(maxAbs > 0)) return []; // 零多项式无离散根
+  const normalized = source.map((v) => v / maxAbs);
+  // 均匀网格与原有 0.5 步长扫描一致；叠加临界点以分离相邻实根并检测重根
+  const grid = [];
+  const segments = Math.ceil((hi - lo) / step);
+  for (let k = 0; k <= segments; k += 1) grid.push(lo + ((hi - lo) * k) / segments);
+  const numericRoots = collectPolynomialRoots(normalized, lo, hi, grid, relTol, mergeTol);
+  // 按原方程复核：相对残差是无量纲量，与系数整体缩放无关
+  const verified = numericRoots.filter((r) => polynomialRelativeResidual(source, r) <= relTol);
+  return Array.from(new Set(verified.slice(0, 8).map((r) => formatNumber(r))));
+}
+
+// 相对残差 |p(x)| / Σ|c_i|·max(1,|x|)^(n-i)：无量纲，系数整体缩放不改变其值
+function polynomialRelativeResidual(coeffs, x) {
+  let p = Math.abs(polyEval(coeffs, x));
+  let scale = polynomialResidualScale(coeffs, x);
+  if (!Number.isFinite(p) || !Number.isFinite(scale)) {
+    // 系数（或 x）量级过大导致尺度上溢时，改用归一化系数计算：
+    // 相对残差与系数整体缩放无关，归一化不改变判定结果，只避免上溢。
+    let maxAbs = 0;
+    for (const v of coeffs) {
+      const a = Math.abs(v);
+      if (Number.isFinite(a) && a > maxAbs) maxAbs = a;
+    }
+    if (!(maxAbs > 0)) return Infinity;
+    const normalized = coeffs.map((v) => v / maxAbs);
+    p = Math.abs(polyEval(normalized, x));
+    scale = polynomialResidualScale(normalized, x);
+  }
+  if (!Number.isFinite(p) || !Number.isFinite(scale) || scale === 0) return Infinity;
+  return p / scale;
 }
 
 function polyEval(coeffs, x) {
   return coeffs.reduce((acc, c) => acc * x + c, 0);
 }
 
+// 二分求根：以区间宽度收敛为准（不再用绝对残差提前退出），
+// 避免斜率很小的根因 |f| 过早达标而损失精度；结果仍由外层统一做残差校验。
 function bisectRoot(coeffs, a, b) {
   let l = a;
   let r = b;
-  for (let i = 0; i < 80; i += 1) {
+  let fl = polyEval(coeffs, l);
+  for (let i = 0; i < 100; i += 1) {
     const m = (l + r) / 2;
     const fm = polyEval(coeffs, m);
-    if (Math.abs(fm) < 1e-10) return m;
-    if (polyEval(coeffs, l) * fm <= 0) r = m;
-    else l = m;
+    if (fm === 0 || r - l <= 1e-14 * Math.max(1, Math.abs(m))) return m;
+    // 用符号比较代替乘积，避免乘积极大/下溢导致选错半区间
+    if ((fl < 0) === (fm < 0)) { l = m; fl = fm; }
+    else r = m;
   }
   return (l + r) / 2;
 }
 
+// 牛顿法求方程数值解：始终返回收敛状态，绝不静默返回未经残差校验的伪根。
+// 成功：{ ok: true, root, residual, iterations }
+// 失败：{ ok: false, reason }（导数为零、发散、迭代到限、表达式无效）
+//
+// 收敛判定说明（与「方程/函数局部尺度」相关，而不是与初值处的 |f(x0)| 相关）：
+//   判据：|f(x)| <= 1e-10 * |f'(x)| * max(1, |x|)
+//   等价形式：牛顿修正量 |f/f'| <= 1e-10 * max(1, |x|)。
+//   该判据对 f 的整体等比例缩放完全不变（f→c·f 时 f/f' 不变），
+//   因此 1e-12·x+1e-12 这类小尺度方程不会被绝对阈值误判为已收敛；
+//   同时它只依赖当前迭代点附近的斜率与 x 的量级，巨大初值不会永久放宽阈值，
+//   所以 x²+1 在初值 1e5 下不会被判成功（残差 9.65 远大于局部尺度）。
 function solveByNewtonSimple(expr, x0) {
-  let x = x0;
-  for (let i = 0; i < 50; i += 1) {
-    const fx = evaluateScopedExpression(expr, { x });
-    const h = 1e-6;
-    const d = (evaluateScopedExpression(expr, { x: x + h }) - evaluateScopedExpression(expr, { x: x - h })) / (2 * h);
-    if (!Number.isFinite(d) || Math.abs(d) < 1e-12) break;
-    const nx = x - fx / d;
-    if (Math.abs(nx - x) < 1e-12) return nx;
+  const start = Number(x0);
+  if (!Number.isFinite(start)) return { ok: false, reason: "初值不是有限数值" };
+  const h = 1e-6;
+  // 重根处牛顿法只线性收敛（(x-r)^k 的收敛比为 1-1/k），迭代次数明显多于单根
+  // （单根通常 3~6 次），故上限取 100 次。
+  const maxIterations = 100;
+  const stepTol = 1e-10; // 修正量相对容差
+  let f0;
+  try {
+    f0 = evaluateScopedExpression(expr, { x: start });
+  } catch (error) {
+    return { ok: false, reason: `表达式求值失败：${error.message || "未知错误"}` };
+  }
+  if (!Number.isFinite(f0)) {
+    return { ok: false, reason: "表达式在初值处无有限值，请检查表达式是否有效" };
+  }
+  const evalAt = (x) => {
+    try {
+      return evaluateScopedExpression(expr, { x });
+    } catch {
+      return NaN; // 迭代点求值失败按不收敛处理
+    }
+  };
+  // 中心差分估计导数；失败返回 NaN
+  const slopeAt = (x) => {
+    const d = (evalAt(x + h) - evalAt(x - h)) / (2 * h);
+    return Number.isFinite(d) ? d : NaN;
+  };
+  const isConverged = (x, fx, d) => {
+    if (fx === 0) return true; // 精确零点
+    if (!Number.isFinite(fx) || !Number.isFinite(d) || d === 0) return false;
+    return Math.abs(fx) <= stepTol * Math.abs(d) * Math.max(1, Math.abs(x));
+  };
+  let x = start;
+  for (let i = 0; i < maxIterations; i += 1) {
+    const fx = evalAt(x);
+    if (!Number.isFinite(fx)) return { ok: false, reason: "迭代点函数值非有限，牛顿法发散" };
+    if (fx === 0) return { ok: true, root: x, residual: 0, iterations: i };
+    const d = slopeAt(x);
+    if (isConverged(x, fx, d)) {
+      return { ok: true, root: x, residual: Math.abs(fx), iterations: i };
+    }
+    if (!Number.isFinite(d) || d === 0) {
+      return { ok: false, reason: "导数接近 0，牛顿法无法继续（该初值可能不收敛或方程无实根）" };
+    }
+    const step = fx / d;
+    const nx = x - step;
+    if (!Number.isFinite(nx)) return { ok: false, reason: "迭代产生非有限值，牛顿法发散" };
+    // 修正量比 x 的量级大 1e12 倍：等价于导数相对函数值过小，继续迭代无意义
+    if (Math.abs(step) > 1e12 * Math.max(1, Math.abs(x))) {
+      return { ok: false, reason: "导数接近 0，牛顿法无法继续（该初值可能不收敛或方程无实根）" };
+    }
     x = nx;
   }
-  return x;
+  // 迭代耗尽：仍用同一判据复核，未达标则明确报失败
+  const lastFx = evalAt(x);
+  const lastResidual = Number.isFinite(lastFx) ? Math.abs(lastFx) : Infinity;
+  if (isConverged(x, lastFx, slopeAt(x))) {
+    return { ok: true, root: x, residual: lastResidual, iterations: maxIterations };
+  }
+  return { ok: false, reason: `迭代 ${maxIterations} 次仍未收敛（残差≈${formatNumber(lastResidual)}）` };
 }
 
 function convertFractionFormats(input) {
@@ -3077,12 +3280,51 @@ function factorial(value) {
   return result;
 }
 
+// 组合/排列：逐项相乘（必要时用 BigInt 精确累乘），避免中间阶乘溢出产生 NaN。
+// 对输入范围、迭代次数（耗时）、不可表示结果作明确限制；保持数值返回类型。
+const COMBINATORICS_MAX_N = Number.MAX_SAFE_INTEGER; // n 上限，保证可精确转为整数
+const COMBINATORICS_MAX_ITERATIONS = 5000;          // 逐项相乘的迭代上限，控制大整数耗时
+
+function validateCombinatoricsInput(n, r) {
+  if (!Number.isFinite(n) || !Number.isFinite(r) ||
+      !Number.isInteger(n) || !Number.isInteger(r) ||
+      n < 0 || r < 0 || r > n) {
+    throw new Error("组合/排列要求 n、r 为非负整数且 0 ≤ r ≤ n");
+  }
+  if (n > COMBINATORICS_MAX_N) {
+    throw new Error(`n 过大（上限 ${COMBINATORICS_MAX_N}），无法保证精度`);
+  }
+}
+
 function permutations(n, r) {
-  return factorial(n) / factorial(n - r);
+  validateCombinatoricsInput(n, r);
+  if (r > COMBINATORICS_MAX_ITERATIONS) {
+    throw new Error(`排列数计算量过大（需 ${r} 次迭代，上限 ${COMBINATORICS_MAX_ITERATIONS}）`);
+  }
+  let result = 1n;
+  for (let i = 0; i < r; i += 1) result *= BigInt(n - i);
+  const value = Number(result);
+  if (!Number.isFinite(value)) {
+    throw new Error("排列数结果超出 JavaScript 数值可表示范围（约 1.8×10^308）");
+  }
+  return value;
 }
 
 function combinations(n, r) {
-  return factorial(n) / (factorial(r) * factorial(n - r));
+  validateCombinatoricsInput(n, r);
+  const k = Math.min(r, n - r); // C(n,r)=C(n,n-r)，取较小迭代数
+  if (k > COMBINATORICS_MAX_ITERATIONS) {
+    throw new Error(`组合数计算量过大（需 ${k} 次迭代，上限 ${COMBINATORICS_MAX_ITERATIONS}）`);
+  }
+  let result = 1n;
+  for (let i = 1; i <= k; i += 1) {
+    result = (result * BigInt(n - k + i)) / BigInt(i); // 每步整除，精确且无中间溢出
+  }
+  const value = Number(result);
+  if (!Number.isFinite(value)) {
+    throw new Error("组合数结果超出 JavaScript 数值可表示范围（约 1.8×10^308）");
+  }
+  return value;
 }
 
 function formatNumber(value) {
